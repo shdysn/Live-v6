@@ -8,6 +8,8 @@ import java.io.OutputStream
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.security.SecureRandom
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import javax.net.ssl.SNIHostName
 import javax.net.ssl.SSLSocket
 import javax.net.ssl.SSLSocketFactory
@@ -17,23 +19,41 @@ class RtmpConnection : RtmpStreamSink {
     private var socket: Socket? = null
     private var outputStream: OutputStream? = null
     private var inputStream: InputStream? = null
-    private val chunkSize = 4096
+    private var outChunkSize = 128
+    private var inChunkSize = 128
     private var isConnected = false
+    private var assignedStreamId = 1
 
     var onStatusListener: ((statusMessage: String, isError: Boolean) -> Unit)? = null
     var onPublishVerified: (() -> Unit)? = null
     var onPublishFailed: ((String) -> Unit)? = null
+
     @Volatile private var isPublishVerified = false
     fun isPublishVerified(): Boolean = isPublishVerified
 
-    fun connect(rtmpUrl: String, streamKey: String, width: Int, height: Int, fps: Int, videoBitrateKbps: Int): Boolean {
-        try {
-            val isRtmps = rtmpUrl.startsWith("rtmps://", ignoreCase = true)
-            val host = extractHost(rtmpUrl)
-            val port = extractPort(rtmpUrl, isRtmps)
-            val app = extractApp(rtmpUrl)
+    private var connectLatch: CountDownLatch? = null
+    private var createStreamLatch: CountDownLatch? = null
 
-            Log.d(TAG, "Connecting to RTMP: host=$host, port=$port, app=$app, isRtmps=$isRtmps")
+    fun connect(
+        rtmpUrl: String,
+        streamKey: String,
+        width: Int,
+        height: Int,
+        fps: Int,
+        videoBitrateKbps: Int
+    ): Boolean {
+        try {
+            // Normalize URL and Key: handle case where user pasted combined URL+Key
+            val (cleanUrl, cleanKey) = normalizeUrlAndKey(rtmpUrl.trim(), streamKey.trim())
+
+            val isRtmps = cleanUrl.startsWith("rtmps://", ignoreCase = true)
+            val host = extractHost(cleanUrl)
+            val port = extractPort(cleanUrl, isRtmps)
+            val app = extractApp(cleanUrl)
+            val tcUrl = cleanUrl.trimEnd('/')
+
+            Log.d(TAG, "Connecting RTMP: host=$host, port=$port, app=$app, isRtmps=$isRtmps, tcUrl=$tcUrl")
+            onStatusListener?.invoke("Connecting to $host:$port…", false)
 
             val s: Socket = if (isRtmps) {
                 val raw = Socket()
@@ -41,6 +61,7 @@ class RtmpConnection : RtmpStreamSink {
                 raw.connect(InetSocketAddress(host, port), 10000)
                 val factory = SSLSocketFactory.getDefault() as SSLSocketFactory
                 val ssl = factory.createSocket(raw, host, port, true) as SSLSocket
+                ssl.useClientMode = true
                 try {
                     val params = ssl.sslParameters
                     params.serverNames = listOf(SNIHostName(host))
@@ -58,43 +79,80 @@ class RtmpConnection : RtmpStreamSink {
             }
 
             s.tcpNoDelay = true
-            s.soTimeout = 12000
+            s.soTimeout = 10000
             socket = s
-            outputStream = BufferedOutputStream(s.getOutputStream(), 16384)
+            outputStream = BufferedOutputStream(s.getOutputStream(), 32768)
             inputStream = s.getInputStream()
 
-            // 1. RTMP Handshake
+            // Reset chunk size to standard initial 128 bytes
+            outChunkSize = 128
+            inChunkSize = 128
+
+            // 1. RTMP C0/C1 -> S0/S1 -> C2 -> S2 Handshake
+            onStatusListener?.invoke("Handshake with streaming server…", false)
             performHandshake()
 
-            // 2. Set Chunk Size to 4096
-            sendSetChunkSize(chunkSize)
+            isConnected = true
+            connectLatch = CountDownLatch(1)
+            createStreamLatch = CountDownLatch(1)
 
-            // 3. Connect Command
-            sendConnect(app, rtmpUrl)
+            // Start reader thread immediately to process server control packets & ACKs
+            startReaderThread()
+
+            // 2. Send Connect Command with initial 128 byte chunk size
+            onStatusListener?.invoke("Negotiating RTMP session…", false)
+            sendConnect(app, tcUrl)
+
+            // 3. Send Set Chunk Size to 4096 (effective for all subsequent messages)
+            sendSetChunkSize(4096)
+
+            // Wait for NetConnection.Connect.Success from server
+            val connectSuccess = connectLatch?.await(8, TimeUnit.SECONDS) ?: false
+            if (!connectSuccess && !isConnected) {
+                throw IllegalStateException("Connection rejected or timed out by server")
+            }
 
             // 4. Stream negotiation
-            sendReleaseStream(streamKey)
-            sendFCPublish(streamKey)
+            sendReleaseStream(cleanKey)
+            sendFCPublish(cleanKey)
             sendCreateStream()
 
-            // 5. Publish
-            sendPublish(streamKey)
+            // Wait for createStream response
+            createStreamLatch?.await(5, TimeUnit.SECONDS)
 
-            // 6. MetaData
-            sendMetaData(width, height, fps, videoBitrateKbps)
+            // 5. Publish to assigned stream ID
+            onStatusListener?.invoke("Publishing stream key to server…", false)
+            sendPublish(cleanKey, assignedStreamId)
 
-            // 7. Initial AAC audio header so ingest server gets audio config immediately
+            // 6. MetaData on assigned stream ID
+            sendMetaData(width, height, fps, videoBitrateKbps, assignedStreamId)
+
+            // 7. Initial AAC audio header
             sendAacSequenceHeader(44100, 2)
 
-            isConnected = true
-            startReaderThread()
-            Log.d(TAG, "RTMP connection successfully established and published!")
+            // Disable socket read timeout for ongoing streaming session
+            try {
+                s.soTimeout = 0
+            } catch (_: Exception) {}
+
+            Log.d(TAG, "RTMP connection successfully established and published to streamId=$assignedStreamId")
             return true
         } catch (e: Exception) {
             Log.e(TAG, "Failed to connect to RTMP server", e)
             close()
             throw e
         }
+    }
+
+    private fun normalizeUrlAndKey(url: String, key: String): Pair<String, String> {
+        if (key.isBlank() && url.contains("/rtmp/")) {
+            val after = url.substringAfterLast("/")
+            val before = url.substringBeforeLast("/") + "/"
+            if (after.startsWith("FB-") || after.length > 8) {
+                return Pair(before, after)
+            }
+        }
+        return Pair(url, key)
     }
 
     private fun performHandshake() {
@@ -104,7 +162,7 @@ class RtmpConnection : RtmpStreamSink {
         // C0
         out.write(0x03)
 
-        // C1
+        // C1 (1536 bytes)
         val c1 = ByteArray(1536)
         SecureRandom().nextBytes(c1)
         c1[0] = 0; c1[1] = 0; c1[2] = 0; c1[3] = 0
@@ -115,18 +173,18 @@ class RtmpConnection : RtmpStreamSink {
         // S0
         val s0 = inStream.read()
         if (s0 != 0x03) {
-            throw IllegalStateException("Invalid RTMP version received: $s0")
+            throw IllegalStateException("Invalid RTMP version received from server: $s0")
         }
 
-        // S1
+        // S1 (1536 bytes)
         val s1 = ByteArray(1536)
         readFully(inStream, s1)
 
-        // C2
+        // C2 (echo of S1)
         out.write(s1)
         out.flush()
 
-        // S2
+        // S2 (echo of C1)
         val s2 = ByteArray(1536)
         readFully(inStream, s2)
     }
@@ -147,20 +205,18 @@ class RtmpConnection : RtmpStreamSink {
         payload[2] = ((size shr 8) and 0xFF).toByte()
         payload[3] = (size and 0xFF).toByte()
         sendRtmpPacket(csid = 2, messageType = 1, streamId = 0, timestamp = 0, payload = payload)
+        outChunkSize = size
     }
 
     private fun sendConnect(app: String, tcUrl: String) {
         val amf = AmfWriter()
         amf.writeString("connect")
         amf.writeNumber(1.0) // Transaction ID
-        val cleanTcUrl = when {
-            tcUrl.endsWith("/") -> tcUrl.dropLast(1)
-            else -> tcUrl
-        }
         val connectProps = mapOf(
             "app" to app,
             "flashVer" to "FMLE/3.0 (compatible; FMSc/1.0)",
-            "tcUrl" to cleanTcUrl,
+            "tcUrl" to tcUrl,
+            "type" to "nonprivate",
             "fpad" to false,
             "capabilities" to 15.0,
             "audioCodecs" to 3191.0,
@@ -197,17 +253,17 @@ class RtmpConnection : RtmpStreamSink {
         sendRtmpPacket(csid = 3, messageType = 20, streamId = 0, timestamp = 0, payload = amf.toByteArray())
     }
 
-    private fun sendPublish(streamKey: String) {
+    private fun sendPublish(streamKey: String, streamId: Int) {
         val amf = AmfWriter()
         amf.writeString("publish")
         amf.writeNumber(5.0)
         amf.writeNull()
         amf.writeString(streamKey)
         amf.writeString("live")
-        sendRtmpPacket(csid = 3, messageType = 20, streamId = 1, timestamp = 0, payload = amf.toByteArray())
+        sendRtmpPacket(csid = 3, messageType = 20, streamId = streamId, timestamp = 0, payload = amf.toByteArray())
     }
 
-    private fun sendMetaData(width: Int, height: Int, fps: Int, videoBitrateKbps: Int) {
+    private fun sendMetaData(width: Int, height: Int, fps: Int, videoBitrateKbps: Int, streamId: Int) {
         val amf = AmfWriter()
         amf.writeString("@setDataFrame")
         amf.writeString("onMetaData")
@@ -225,7 +281,7 @@ class RtmpConnection : RtmpStreamSink {
             "audiocodecid" to 10.0 // AAC
         )
         amf.writeEcmaArray(meta)
-        sendRtmpPacket(csid = 3, messageType = 18, streamId = 1, timestamp = 0, payload = amf.toByteArray())
+        sendRtmpPacket(csid = 3, messageType = 18, streamId = streamId, timestamp = 0, payload = amf.toByteArray())
     }
 
     override fun sendAvcSequenceHeader(sps: ByteArray, pps: ByteArray) {
@@ -241,25 +297,25 @@ class RtmpConnection : RtmpStreamSink {
 
         // AVCDecoderConfigurationRecord
         out.write(0x01) // configurationVersion
-        out.write(if (cleanSps.size > 1) cleanSps[1].toInt() and 0xFF else 0x42) // AVCProfileIndication
-        out.write(if (cleanSps.size > 2) cleanSps[2].toInt() and 0xFF else 0x00) // profile_compatibility
-        out.write(if (cleanSps.size > 3) cleanSps[3].toInt() and 0xFF else 0x1F) // AVCLevelIndication
-        out.write(0xFF) // lengthSizeMinusOne (4 bytes length: 11111111b -> lengthSizeMinusOne = 3)
+        out.write(if (cleanSps.size > 1) cleanSps[1].toInt() and 0xFF else 0x42)
+        out.write(if (cleanSps.size > 2) cleanSps[2].toInt() and 0xFF else 0x00)
+        out.write(if (cleanSps.size > 3) cleanSps[3].toInt() and 0xFF else 0x1F)
+        out.write(0xFF)
 
         // SPS
-        out.write(0xE1) // numOfSequenceParameterSets = 1
+        out.write(0xE1)
         out.write((cleanSps.size shr 8) and 0xFF)
         out.write(cleanSps.size and 0xFF)
         out.write(cleanSps)
 
         // PPS
-        out.write(0x01) // numOfPictureParameterSets = 1
+        out.write(0x01)
         out.write((cleanPps.size shr 8) and 0xFF)
         out.write(cleanPps.size and 0xFF)
         out.write(cleanPps)
 
         val payload = out.toByteArray()
-        sendRtmpPacket(csid = 6, messageType = 9, streamId = 1, timestamp = 0, payload = payload)
+        sendRtmpPacket(csid = 6, messageType = 9, streamId = assignedStreamId, timestamp = 0, payload = payload)
     }
 
     override fun sendVideoNalu(nalu: ByteArray, isKeyframe: Boolean, timestampMs: Long) {
@@ -282,7 +338,7 @@ class RtmpConnection : RtmpStreamSink {
         out.write(len and 0xFF)
         out.write(cleanNalu)
 
-        sendRtmpPacket(csid = 6, messageType = 9, streamId = 1, timestamp = timestampMs, payload = out.toByteArray())
+        sendRtmpPacket(csid = 6, messageType = 9, streamId = assignedStreamId, timestamp = timestampMs, payload = out.toByteArray())
     }
 
     private fun removeStartCode(data: ByteArray): ByteArray {
@@ -301,9 +357,6 @@ class RtmpConnection : RtmpStreamSink {
         out.write(0x00) // AAC sequence header
 
         // AudioSpecificConfig (2 bytes for AAC-LC)
-        // Object Type: AAC-LC = 2 (5 bits)
-        // Sample Rate Index: 44100 = 4 (4 bits)
-        // Channels: 2 = 2 (4 bits)
         val audioObjectType = 2
         val sampleRateIndex = 4
         val byte1 = (audioObjectType shl 3) or (sampleRateIndex shr 1)
@@ -311,7 +364,7 @@ class RtmpConnection : RtmpStreamSink {
         out.write(byte1 and 0xFF)
         out.write(byte2 and 0xFF)
 
-        sendRtmpPacket(csid = 4, messageType = 8, streamId = 1, timestamp = 0, payload = out.toByteArray())
+        sendRtmpPacket(csid = 4, messageType = 8, streamId = assignedStreamId, timestamp = 0, payload = out.toByteArray())
     }
 
     override fun sendAudioFrame(data: ByteArray, offset: Int, size: Int, timestampMs: Long) {
@@ -319,7 +372,7 @@ class RtmpConnection : RtmpStreamSink {
         out.write(0xAF)
         out.write(0x01) // AAC raw
         out.write(data, offset, size)
-        sendRtmpPacket(csid = 4, messageType = 8, streamId = 1, timestamp = timestampMs, payload = out.toByteArray())
+        sendRtmpPacket(csid = 4, messageType = 8, streamId = assignedStreamId, timestamp = timestampMs, payload = out.toByteArray())
     }
 
     @Synchronized
@@ -350,14 +403,14 @@ class RtmpConnection : RtmpStreamSink {
         out.write((streamId shr 16) and 0xFF)
         out.write((streamId shr 24) and 0xFF)
 
-        // Write first chunk
-        val firstChunkSize = minOf(chunkSize, length)
+        // Write first chunk using current outChunkSize (128 for connect, 4096 thereafter)
+        val firstChunkSize = minOf(outChunkSize, length)
         out.write(payload, 0, firstChunkSize)
         offset += firstChunkSize
 
         // Subsequent chunks: Type 3 Chunk Header (1 byte basic header)
         while (offset < length) {
-            val chunkLen = minOf(chunkSize, length - offset)
+            val chunkLen = minOf(outChunkSize, length - offset)
             out.write((0x03 shl 6) or (csid and 0x3F))
             out.write(payload, offset, chunkLen)
             offset += chunkLen
@@ -375,28 +428,38 @@ class RtmpConnection : RtmpStreamSink {
                 try {
                     val read = inStream.read(buffer)
                     if (read < 0) {
-                        Log.d(TAG, "Server closed input stream")
+                        Log.d(TAG, "Server closed socket stream")
                         isConnected = false
-                        onStatusListener?.invoke("Server disconnected socket. Check stream key.", true)
                         break
                     }
                     if (read > 0) {
-                        val str = String(buffer, 0, minOf(read, 1024), Charsets.ISO_8859_1)
+                        val str = String(buffer, 0, minOf(read, 2048), Charsets.ISO_8859_1)
+
+                        if (str.contains("NetConnection.Connect.Success")) {
+                            Log.d(TAG, "RTMP connection accepted: NetConnection.Connect.Success")
+                            connectLatch?.countDown()
+                            onStatusListener?.invoke("Session accepted by server", false)
+                        }
+
+                        if (str.contains("_result")) {
+                            connectLatch?.countDown()
+                            createStreamLatch?.countDown()
+                        }
+
                         if (str.contains("NetStream.Publish.Start")) {
                             Log.d(TAG, "RTMP server confirmed: NetStream.Publish.Start")
                             isPublishVerified = true
                             onPublishVerified?.invoke()
-                            onStatusListener?.invoke("Live transmission accepted by server", false)
+                            onStatusListener?.invoke("Live broadcast transmission verified", false)
                         } else if (str.contains("NetStream.Publish.BadName") || str.contains("Connect.Rejected") || str.contains("Publish.Denied")) {
                             Log.e(TAG, "RTMP server rejected stream: $str")
-                            onPublishFailed?.invoke("Facebook rejected stream key. Please check key in Live Producer.")
+                            onPublishFailed?.invoke("Facebook rejected stream key. Please check your key in Live Producer.")
                             onStatusListener?.invoke("Server rejected stream key. Please check key in Live Producer.", true)
                         }
                     }
                 } catch (e: Exception) {
                     if (isConnected) {
                         Log.w(TAG, "Reader thread exception: ${e.message}")
-                        onStatusListener?.invoke("Socket read error: ${e.message}", true)
                     }
                     break
                 }
@@ -409,6 +472,8 @@ class RtmpConnection : RtmpStreamSink {
 
     fun close() {
         isConnected = false
+        connectLatch?.countDown()
+        createStreamLatch?.countDown()
         readerThread?.interrupt()
         readerThread = null
         try { outputStream?.flush() } catch (_: Exception) {}
@@ -445,9 +510,8 @@ class RtmpConnection : RtmpStreamSink {
 
     private fun extractApp(url: String): String {
         return try {
-            val path = url.substringAfter("://").substringAfter("/")
-            val app = path.substringBefore("/").trim()
-            if (app.isNotBlank()) app else "live"
+            val path = url.substringAfter("://").substringAfter("/", "").trim().trimEnd('/')
+            if (path.isNotBlank()) path else "live"
         } catch (_: Exception) {
             "live"
         }

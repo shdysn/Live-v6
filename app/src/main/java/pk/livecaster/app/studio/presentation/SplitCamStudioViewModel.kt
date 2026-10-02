@@ -82,6 +82,8 @@ data class SplitCamStudioUiState(
     val chatMessages: List<StudioChatMessage> = emptyList(),
     // Active session
     val currentBroadcastId: Long? = null,
+    // Destination editing
+    val editingDestination: DestinationEntity? = null,
     // Sheets
     val showDestinationsSheet: Boolean = false,
     val showSettingsSheet: Boolean = false,
@@ -378,8 +380,15 @@ class SplitCamStudioViewModel(
             } else {
                 database.destinationDao().updateDestination(entity)
             }
-            _uiState.value = _uiState.value.copy(showAddDestinationDialog = false)
+            _uiState.value = _uiState.value.copy(showAddDestinationDialog = false, editingDestination = null)
         }
+    }
+
+    fun startEditDestination(dest: DestinationEntity?) {
+        _uiState.value = _uiState.value.copy(
+            editingDestination = dest,
+            showAddDestinationDialog = true
+        )
     }
 
     fun deleteDestination(destination: DestinationEntity) {

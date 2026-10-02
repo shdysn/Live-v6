@@ -66,7 +66,11 @@ import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.Subtitles
 import androidx.compose.material.icons.filled.Videocam
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Visibility
+import androidx.compose.material.icons.filled.VisibilityOff
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -798,7 +802,8 @@ fun SplitCamStudioScreen(
                 destinations = uiState.destinations,
                 selectedIds = uiState.selectedDestinationIds,
                 onToggleSelect = { viewModel.toggleDestinationSelection(it) },
-                onAddDestination = { viewModel.setShowAddDestinationDialog(true) },
+                onAddDestination = { viewModel.startEditDestination(null) },
+                onEditDestination = { viewModel.startEditDestination(it) },
                 onDeleteDestination = { viewModel.deleteDestination(it) },
                 onClose = { viewModel.setShowDestinationsSheet(false) }
             )
@@ -881,12 +886,14 @@ fun SplitCamStudioScreen(
         }
     }
 
-    // Add Destination Dialog
+    // Add / Edit Destination Dialog
     if (uiState.showAddDestinationDialog) {
         AddDestinationDialog(
+            editing = uiState.editingDestination,
             onDismiss = { viewModel.setShowAddDestinationDialog(false) },
             onSave = { name, platform, url, key ->
                 viewModel.saveDestination(
+                    id = uiState.editingDestination?.id ?: 0L,
                     name = name,
                     platform = platform,
                     rtmpUrl = url,
@@ -1263,6 +1270,7 @@ fun DestinationsManagerSheetContent(
     selectedIds: Set<Long>,
     onToggleSelect: (Long) -> Unit,
     onAddDestination: () -> Unit,
+    onEditDestination: (DestinationEntity) -> Unit,
     onDeleteDestination: (DestinationEntity) -> Unit,
     onClose: () -> Unit
 ) {
@@ -1295,7 +1303,7 @@ fun DestinationsManagerSheetContent(
 
         Spacer(modifier = Modifier.height(8.dp))
         Text(
-            text = "Select all platforms you want to stream to simultaneously. Toggle ON and hit GO LIVE!",
+            text = "Select all platforms you want to stream to simultaneously. Tap the pencil to edit Stream Key.",
             style = MaterialTheme.typography.bodySmall.copy(color = TextSecondary)
         )
         Spacer(modifier = Modifier.height(14.dp))
@@ -1309,7 +1317,9 @@ fun DestinationsManagerSheetContent(
             items(destinations) { dest ->
                 val isSelected = selectedIds.contains(dest.id)
                 Card(
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { onEditDestination(dest) },
                     shape = RoundedCornerShape(12.dp),
                     colors = CardDefaults.cardColors(containerColor = Color(0xFF161B22)),
                     border = androidx.compose.foundation.BorderStroke(
@@ -1325,13 +1335,33 @@ fun DestinationsManagerSheetContent(
                         horizontalArrangement = Arrangement.SpaceBetween
                     ) {
                         Column(modifier = Modifier.weight(1f)) {
-                            Text(
-                                text = dest.name,
-                                style = MaterialTheme.typography.titleSmall.copy(
-                                    fontWeight = FontWeight.Bold,
-                                    color = TextPrimary
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text(
+                                    text = dest.name,
+                                    style = MaterialTheme.typography.titleSmall.copy(
+                                        fontWeight = FontWeight.Bold,
+                                        color = TextPrimary
+                                    )
                                 )
-                            )
+                                Spacer(modifier = Modifier.width(6.dp))
+                                if (dest.streamKey.isNotBlank()) {
+                                    Text(
+                                        text = "• Key Configured",
+                                        style = MaterialTheme.typography.labelSmall.copy(
+                                            color = StudioGreen,
+                                            fontSize = 10.sp
+                                        )
+                                    )
+                                } else {
+                                    Text(
+                                        text = "• Key Missing",
+                                        style = MaterialTheme.typography.labelSmall.copy(
+                                            color = StudioAmber,
+                                            fontSize = 10.sp
+                                        )
+                                    )
+                                }
+                            }
                             Spacer(modifier = Modifier.height(2.dp))
                             Text(
                                 text = dest.rtmpUrl,
@@ -1354,6 +1384,18 @@ fun DestinationsManagerSheetContent(
                         )
 
                         Spacer(modifier = Modifier.width(4.dp))
+                        IconButton(
+                            onClick = { onEditDestination(dest) },
+                            modifier = Modifier.size(32.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Edit,
+                                contentDescription = "Edit Stream Key",
+                                tint = StudioCyan,
+                                modifier = Modifier.size(16.dp)
+                            )
+                        }
+
                         IconButton(
                             onClick = { onDeleteDestination(dest) },
                             modifier = Modifier.size(32.dp)
@@ -1810,20 +1852,27 @@ fun BroadcastHistorySheetContent(
 
 @Composable
 fun AddDestinationDialog(
+    editing: DestinationEntity? = null,
     onDismiss: () -> Unit,
     onSave: (String, String, String, String) -> Unit
 ) {
-    var selectedPreset by remember { mutableStateOf(PLATFORM_PRESETS.first()) }
-    var name by remember { mutableStateOf(selectedPreset.name) }
-    var rtmpUrl by remember { mutableStateOf(selectedPreset.defaultRtmpUrl) }
-    var streamKey by remember { mutableStateOf("") }
+    val initialPreset = if (editing != null) {
+        PLATFORM_PRESETS.find { it.id == editing.platform } ?: PLATFORM_PRESETS.first()
+    } else {
+        PLATFORM_PRESETS.first()
+    }
+    var selectedPreset by remember(editing) { mutableStateOf(initialPreset) }
+    var name by remember(editing) { mutableStateOf(editing?.name ?: initialPreset.name) }
+    var rtmpUrl by remember(editing) { mutableStateOf(editing?.rtmpUrl ?: initialPreset.defaultRtmpUrl) }
+    var streamKey by remember(editing) { mutableStateOf(editing?.streamKey ?: "") }
+    var isKeyVisible by remember { mutableStateOf(false) }
 
     AlertDialog(
         onDismissRequest = onDismiss,
         containerColor = StudioCard,
         title = {
             Text(
-                text = "Add RTMP Streaming Destination",
+                text = if (editing != null) "Edit RTMP Destination" else "Add RTMP Streaming Destination",
                 color = TextPrimary,
                 fontWeight = FontWeight.Bold
             )
@@ -1843,8 +1892,10 @@ fun AddDestinationDialog(
                             selected = selectedPreset.id == preset.id,
                             onClick = {
                                 selectedPreset = preset
-                                name = preset.name
-                                rtmpUrl = preset.defaultRtmpUrl
+                                if (editing == null) {
+                                    name = preset.name
+                                    rtmpUrl = preset.defaultRtmpUrl
+                                }
                             },
                             label = { Text(preset.name, fontSize = 11.sp) }
                         )
@@ -1878,6 +1929,16 @@ fun AddDestinationDialog(
                     onValueChange = { streamKey = it },
                     label = { Text("Stream Key") },
                     placeholder = { Text(selectedPreset.defaultKeyHint) },
+                    trailingIcon = {
+                        IconButton(onClick = { isKeyVisible = !isKeyVisible }) {
+                            Icon(
+                                imageVector = if (isKeyVisible) Icons.Default.VisibilityOff else Icons.Default.Visibility,
+                                contentDescription = if (isKeyVisible) "Hide Key" else "Show Key",
+                                tint = TextMuted
+                            )
+                        }
+                    },
+                    visualTransformation = if (isKeyVisible) VisualTransformation.None else PasswordVisualTransformation(),
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
                 )
@@ -1892,7 +1953,7 @@ fun AddDestinationDialog(
                 },
                 colors = ButtonDefaults.buttonColors(containerColor = LiveRed)
             ) {
-                Text("Save Destination", color = Color.White)
+                Text(if (editing != null) "Update Destination" else "Save Destination", color = Color.White)
             }
         },
         dismissButton = {

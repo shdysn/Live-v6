@@ -151,12 +151,15 @@ class RtmpPublisher(
                 aEnc.start()
 
                 // 3. Verification countdown phase (15 seconds)
-                // App stays in CONNECTING until Facebook/YouTube actually confirms NetStream.Publish.Start
                 var verified = false
                 var remainingCountdown = 15
+                var loopCount = 0
                 while (isActive && remainingCountdown > 0 && !verified) {
-                    delay(1000)
-                    remainingCountdown--
+                    delay(500)
+                    loopCount++
+                    if (loopCount % 2 == 0) {
+                        remainingCountdown--
+                    }
 
                     // Check if server rejected or disconnected
                     if (_telemetry.value.status == StreamStatus.ERROR) {
