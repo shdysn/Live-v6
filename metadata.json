@@ -1,0 +1,6 @@
+{
+  "name": "LiveCaster",
+  "description": "Live Multistreaming Studio for Android inspired by SplitCam: Broadcast simultaneously to YouTube, Facebook, Twitch, Kick, and Custom RTMP with real-time video filters, in-stream chat overlay, and live telemetry",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
