@@ -34,12 +34,20 @@ class CameraCaptureManager(private val context: Context) {
         previewView: PreviewView,
         onCameraReady: () -> Unit = {}
     ) {
-        val cameraProviderFuture = ProcessCameraProvider.getInstance(context)
-        cameraProviderFuture.addListener({
-            cameraProvider = cameraProviderFuture.get()
-            startCameraPreview(lifecycleOwner, previewView)
-            onCameraReady()
-        }, ContextCompat.getMainExecutor(context))
+        try {
+            val cameraProviderFuture = ProcessCameraProvider.getInstance(context)
+            cameraProviderFuture.addListener({
+                try {
+                    cameraProvider = cameraProviderFuture.get()
+                    startCameraPreview(lifecycleOwner, previewView)
+                    onCameraReady()
+                } catch (e: Throwable) {
+                    android.util.Log.e("CameraCaptureManager", "Failed to start camera preview", e)
+                }
+            }, ContextCompat.getMainExecutor(context))
+        } catch (e: Throwable) {
+            android.util.Log.e("CameraCaptureManager", "ProcessCameraProvider unavailable", e)
+        }
     }
 
     private fun startCameraPreview(lifecycleOwner: LifecycleOwner, previewView: PreviewView) {

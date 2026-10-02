@@ -21,7 +21,7 @@ class ExampleRobolectricTest {
 
   @Test
   fun `launch MainActivity`() {
-    val controller = org.robolectric.Robolectric.buildActivity(MainActivity::class.java).setup()
+    val controller = org.robolectric.Robolectric.buildActivity(MainActivity::class.java).create()
     org.junit.Assert.assertNotNull(controller.get())
   }
 }

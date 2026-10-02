@@ -71,6 +71,7 @@ android {
       isIncludeAndroidResources = true
       isReturnDefaultValues = true
       all {
+        it.maxHeapSize = "1536m"
         it.testLogging {
           events("passed", "skipped", "failed", "standardOut", "standardError")
           showStandardStreams = true

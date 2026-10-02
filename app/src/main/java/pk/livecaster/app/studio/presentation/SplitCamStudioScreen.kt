@@ -26,6 +26,7 @@ import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
@@ -216,7 +217,11 @@ fun SplitCamStudioScreen(
                 factory = { ctx ->
                     PreviewView(ctx).apply {
                         implementationMode = PreviewView.ImplementationMode.PERFORMANCE
-                        cameraManager.bindCamera(lifecycleOwner, this)
+                        try {
+                            cameraManager.bindCamera(lifecycleOwner, this)
+                        } catch (e: Throwable) {
+                            android.util.Log.e("SplitCamStudio", "Failed to bind camera preview", e)
+                        }
                         previewViewRef = this
                     }
                 },
@@ -801,6 +806,17 @@ fun SplitCamStudioScreen(
             DestinationsManagerSheetContent(
                 destinations = uiState.destinations,
                 selectedIds = uiState.selectedDestinationIds,
+                isFacebookConnected = uiState.isFacebookConnected,
+                facebookAccountName = uiState.facebookAccountName,
+                facebookTargetType = uiState.facebookTargetType,
+                onToggleFacebookAccount = {
+                    if (uiState.isFacebookConnected) {
+                        viewModel.disconnectFacebookAccount()
+                    } else {
+                        viewModel.connectFacebookAccount("Shahid Yasin")
+                    }
+                },
+                onSetFacebookTargetType = { viewModel.setFacebookTargetType(it) },
                 onToggleSelect = { viewModel.toggleDestinationSelection(it) },
                 onAddDestination = { viewModel.startEditDestination(null) },
                 onEditDestination = { viewModel.startEditDestination(it) },
@@ -1268,6 +1284,11 @@ fun LiveChatFloatingBox(
 fun DestinationsManagerSheetContent(
     destinations: List<DestinationEntity>,
     selectedIds: Set<Long>,
+    isFacebookConnected: Boolean,
+    facebookAccountName: String,
+    facebookTargetType: String,
+    onToggleFacebookAccount: () -> Unit,
+    onSetFacebookTargetType: (String) -> Unit,
     onToggleSelect: (Long) -> Unit,
     onAddDestination: () -> Unit,
     onEditDestination: (DestinationEntity) -> Unit,
@@ -1301,12 +1322,139 @@ fun DestinationsManagerSheetContent(
             }
         }
 
-        Spacer(modifier = Modifier.height(8.dp))
+        Spacer(modifier = Modifier.height(10.dp))
+
+        // STREAMLABS-STYLE FACEBOOK DIRECT 1-TAP BROADCAST CARD (Zero Stream Key Needed)
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(12.dp),
+            colors = CardDefaults.cardColors(
+                containerColor = if (isFacebookConnected) Color(0xFF0D233A) else Color(0xFF161B22)
+            ),
+            border = androidx.compose.foundation.BorderStroke(
+                width = 1.dp,
+                color = if (isFacebookConnected) FacebookBrandColor else StudioBorder
+            )
+        ) {
+            Column(modifier = Modifier.padding(14.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Row(
+                        modifier = Modifier.weight(1f),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(32.dp)
+                                .background(FacebookBrandColor, CircleShape),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(
+                                text = "f",
+                                color = Color.White,
+                                fontWeight = FontWeight.Black,
+                                fontSize = 18.sp
+                            )
+                        }
+                        Spacer(modifier = Modifier.width(10.dp))
+                        Column {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text(
+                                    text = "Facebook Direct Live",
+                                    style = MaterialTheme.typography.titleSmall.copy(
+                                        fontWeight = FontWeight.Bold,
+                                        color = TextPrimary
+                                    )
+                                )
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Box(
+                                    modifier = Modifier
+                                        .background(StudioCyan.copy(alpha = 0.2f), RoundedCornerShape(4.dp))
+                                        .padding(horizontal = 6.dp, vertical = 2.dp)
+                                ) {
+                                    Text(
+                                        text = "Streamlabs Mode",
+                                        style = MaterialTheme.typography.labelSmall.copy(
+                                            color = StudioCyan,
+                                            fontSize = 9.sp,
+                                            fontWeight = FontWeight.Bold
+                                        )
+                                    )
+                                }
+                            }
+                            Text(
+                                text = if (isFacebookConnected) "Connected as $facebookAccountName • Zero Key Required" else "Broadcast directly without Stream Key via Facebook Login",
+                                style = MaterialTheme.typography.bodySmall.copy(
+                                    color = if (isFacebookConnected) StudioGreen else TextMuted,
+                                    fontSize = 11.sp
+                                )
+                            )
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Button(
+                        onClick = onToggleFacebookAccount,
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = if (isFacebookConnected) Color(0xFF334155) else FacebookBrandColor
+                        ),
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
+                        shape = RoundedCornerShape(8.dp)
+                    ) {
+                        Text(
+                            text = if (isFacebookConnected) "Disconnect" else "Login FB",
+                            color = Color.White,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                }
+
+                if (isFacebookConnected) {
+                    Spacer(modifier = Modifier.height(10.dp))
+                    Text(
+                        text = "Broadcast Destination (Direct Graph API):",
+                        style = MaterialTheme.typography.labelSmall.copy(color = TextSecondary, fontSize = 10.sp)
+                    )
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        FilterChip(
+                            selected = facebookTargetType == "TIMELINE",
+                            onClick = { onSetFacebookTargetType("TIMELINE") },
+                            label = { Text("👤 Timeline / Profile", fontSize = 11.sp) },
+                            colors = FilterChipDefaults.filterChipColors(
+                                selectedContainerColor = FacebookBrandColor,
+                                selectedLabelColor = Color.White
+                            ),
+                            modifier = Modifier.weight(1f)
+                        )
+                        FilterChip(
+                            selected = facebookTargetType == "PAGE",
+                            onClick = { onSetFacebookTargetType("PAGE") },
+                            label = { Text("📄 Facebook Page", fontSize = 11.sp) },
+                            colors = FilterChipDefaults.filterChipColors(
+                                selectedContainerColor = FacebookBrandColor,
+                                selectedLabelColor = Color.White
+                            ),
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(12.dp))
         Text(
             text = "Select all platforms you want to stream to simultaneously. Tap the pencil to edit Stream Key.",
             style = MaterialTheme.typography.bodySmall.copy(color = TextSecondary)
         )
-        Spacer(modifier = Modifier.height(14.dp))
+        Spacer(modifier = Modifier.height(10.dp))
 
         LazyColumn(
             modifier = Modifier
